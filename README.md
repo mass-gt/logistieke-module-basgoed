@@ -1,0 +1,1 @@
+# logistieke-module-basgoed
