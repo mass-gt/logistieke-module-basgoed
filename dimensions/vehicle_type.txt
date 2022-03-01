@@ -1,0 +1,12 @@
+ID	IsRefTypeFreight	IsAvailableInParcelModule	Comment
+0	1	0	"Truck (small)"
+1	1	0	"Truck (medium)"
+2	1	0	"Truck (large)"
+3	1	0	"Truck+trailer (small)"
+4	1	0	"Truck+trailer (large)"
+5	1	0	"Tractor+trailer"
+6	1	0	"Special vehicle"
+7	1	0	"LZV"
+8	1	1	"Van"
+9	0	1	"LEVV"
+10	0	0	"Moped"

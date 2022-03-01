@@ -1,0 +1,12 @@
+ID	Comment
+0	"0: Agricultural products and live animals"
+1	"1: Foodstuffs and animal fodder"
+2	"2: Solid mineral fuels"
+3	"3: Petroleum products"
+4	" 4: Ores and metal waste"
+5	"5: Metal products"
+6	"6: Crude and manufactured minerals, building materials"
+7	"7: Fertilizers"
+8	"8: Chemicals"
+9	"9: Machinery, transport equipment, manufactured articles and miscellaneous articles"
+-1	"-1: Empty"

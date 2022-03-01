@@ -1,0 +1,13 @@
+ID	IsExternal	Comment
+1	0	"1: Direct"
+2	0	"2: To DC"
+3	0	"3: From DC"
+4	0	"4: To TT"
+5	0	"5: Between DCs"
+6	0	"6: From TT"
+7	0	"7: DC to TT"
+8	0	"8: TT to DC"
+9	0	"9: Between TTs"
+10	1	"10: Ext. direct"
+11	1	"11: Ext. to/from DC"
+12	1	"12: Ext. to/from TT"

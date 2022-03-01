@@ -1,0 +1,10 @@
+ID	Comment
+0	"0: Food (general cargo)"
+1	"1: Miscellaneous (general cargo)"
+2	"2: Temperature controlled"
+3	"3: Facility logistics"
+4	"4: Construction logistics"
+5	"5: Waste"
+6	"6: Parcel (consolidated flows)"
+7	"7: Dangerous"
+8	"8: Parcel (deliveries)"

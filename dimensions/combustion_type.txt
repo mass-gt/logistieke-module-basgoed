@@ -1,0 +1,6 @@
+ID	Comment
+0	"Fuel"
+1	"Electric"
+2	"Hydrogen"
+3	"Hybrid (electric)"
+4	"Biofuel"
