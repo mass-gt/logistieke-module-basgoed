@@ -4,7 +4,7 @@ import time
 import datetime
 import shapefile as shp
 from numba import njit, float64
-from __functions__ import read_mtx, read_shape
+from __functions__ import read_mtx, read_shape, get_skims
 
 # Modules nodig voor de user interface
 import tkinter as tk
@@ -111,83 +111,6 @@ class Root:
         Thread(target=actually_run_module, args=self.args, daemon=True).start()
 
 
-@njit
-def choice_model_ssvt(
-    costFreightKm: np.ndarray, costFreightHr: np.ndarray,
-    goodsTypeBG: int,
-    fromDC: int, toDC: int,
-    travTime: float, distance: float,
-    absoluteShipmentSizes: np.ndarray,
-    truckCapacities: np.ndarray,
-    B_TransportCosts: float, B_InventoryCosts: float,
-    B_FromDC: float, B_ToDC: float,
-    B_LongHaul_TruckTrailer: float, B_LongHaul_TractorTrailer: float,
-    ASC_VT: float,
-    nVT: int, nSS: int,
-    container: bool = False
-):
-
-    # Determine the utility and probability for each alternative
-    utilities = np.zeros(nVT * nSS, dtype=float64)
-
-    inventoryCosts = absoluteShipmentSizes
-    longHaul = int(distance > 100)
-
-    for ss in range(nSS):
-        for vt in range(nVT):
-            index = ss * nVT + vt
-            costPerHr = costFreightHr[goodsTypeBG - 1, vt]
-            costPerKm = costFreightKm[goodsTypeBG - 1, vt]
-
-            # If vehicle type is available for the current goods type
-            if costPerHr > 0:
-                transportCosts = costPerHr * travTime + costPerKm * distance
-
-                # Multiply transport costs by number of required vehicles
-                transportCosts *= np.ceil(
-                    absoluteShipmentSizes[ss] / truckCapacities[vt])
-
-                # Utility function
-                if container and vt != 5:
-                    utilities[index] = -100
-                else:
-                    utilities[index] = (
-                        B_TransportCosts * transportCosts +
-                        B_InventoryCosts * inventoryCosts[ss] +
-                        B_FromDC * fromDC * (vt == 0) +
-                        B_ToDC * toDC * (vt in [3, 4, 5]) +
-                        B_LongHaul_TruckTrailer * longHaul * (vt in [3, 4]) +
-                        B_LongHaul_TractorTrailer * longHaul * (vt == 5) +
-                        ASC_VT[vt])
-            else:
-                utilities[index] = -100
-
-    probs = np.exp(utilities) / np.sum(np.exp(utilities))
-    cumProbs = np.cumsum(probs)
-
-    # Sample one choice based on the cumulative probability distribution
-    ssvt = draw_choice(cumProbs)
-
-    return ssvt
-
-
-@njit
-def draw_choice(cumProbs: np.ndarray):
-    '''
-    Draw one choice from a list of cumulative probabilities.
-    '''
-    nAlt = len(cumProbs)
-
-    rand = np.random.rand()
-    for alt in range(nAlt):
-        if cumProbs[alt] >= rand:
-            return alt
-
-    raise Exception(
-        '\nError in function "draw_choice", random draw was ' +
-        'outside range of cumulative probability distribution.')
-
-
 def actually_run_module(args):
 
     try:
@@ -265,8 +188,10 @@ def actually_run_module(args):
                 'YEAR parameter is not 2018, 2030, 2040 or 2050, but ' +
                 str(varDict['YEAR']) + ' instead.')
 
+        # Zijn we het basisjaar of een zichtjaar aan het draaien
         forecast = (varDict['YEAR'] > varDict['BASEYEAR'])
 
+        # Werkgelegenheidssectoren
         jobNames = [
             'LANDBOUW' + yrAppendix,
             'INDUSTRIE' + yrAppendix,
@@ -277,6 +202,7 @@ def actually_run_module(args):
         jobDict = dict((jobNames[i], i) for i in range(len(jobNames)))
         nSectors = len(jobNames)
 
+        # Laadvermogen en zendinggrootte-categorieen
         truckCapacities = np.array(pd.read_csv(
             varDict['VEHCAPACITY'],
             index_col=0))[:, 0] / 1000
@@ -285,12 +211,13 @@ def actually_run_module(args):
         if root != '':
             root.progressBar['value'] = 0.2
 
-        # Conversion tables for goods types and sectors in make-use table
+        # Conversietabel voor goederengroepen in make-use tabel
         convGG = np.array(pd.read_csv(
             varDict['BASGOED_PARAMETERS'] + "Goederengroep.asc",
             sep='\t'), dtype=int)
         convGG = dict((convGG[i, :]) for i in range(len(convGG)))
 
+        # Conversietabel voor sectoren in make-use tabel
         convSector = np.array(pd.read_csv(
             varDict['SECTOR_TO_SECTOR'], sep=','))
         convSector[:, 1] = [jobDict[x + yrAppendix] for x in convSector[:, 1]]
@@ -298,186 +225,28 @@ def actually_run_module(args):
             (int(convSector[i, 0]), int(convSector[i, 1]))
             for i in range(len(convSector)))
 
-        # Import make-use table BasGoed
-        makeUseTable = np.array(pd.read_csv(
-            varDict['BASGOED_PARAMETERS'] + "MakeUseEerstJr.asc",
-            sep='\t'))
-
-        # Convert the goods types and sectors
-        for i in range(len(makeUseTable)):
-            if makeUseTable[i, 0] in convGG.keys():
-                makeUseTable[i, 0] = convGG[makeUseTable[i, 0]]
-            else:
-                makeUseTable[i, 0] = -1
-
-            if makeUseTable[i, 1] in convSector.keys():
-                makeUseTable[i, 1] = convSector[makeUseTable[i, 1]]
-            else:
-                makeUseTable[i, 1] = -1
-
-        # Remove rows with no known converstion for the goods type or sector
-        makeUseTable = makeUseTable[
-            (makeUseTable[:, 0] >= 0) & (makeUseTable[:, 1] >= 0), :]
-
-        # Create make and use distribution tables
-        # (by BG-GG and NRM-industry-sector)
-        makeDistribution = np.zeros((nGG, nSectors))
-        useDistribution = np.zeros((nGG, nSectors))
-        for i in range(len(makeUseTable)):
-            gg = int(makeUseTable[i, 0])
-            sector = int(makeUseTable[i, 1])
-            makeWeight = makeUseTable[i, 2]
-            useWeight = makeUseTable[i, 3]
-
-            makeDistribution[gg - 1, sector] += makeWeight
-            useDistribution[gg - 1,  sector] += useWeight
-
-        for gg in range(nGG):
-            sumMake = np.sum(makeDistribution[gg, :])
-            sumUse = np.sum(useDistribution[gg, :])
-
-            if sumMake > 0:
-                makeDistribution[gg, :] /= sumMake
-            else:
-                makeDistribution[gg, :] = (np.ones(nSectors) / nSectors)
-
-            if sumUse > 0:
-                useDistribution[gg, :] /= sumUse
-            else:
-                useDistribution[gg, :] = (np.ones(nSectors) / nSectors)
+        # Inlezen maak-gebruik tabellen
+        makeDistribution, useDistribution = get_make_use(
+            varDict, convGG, convSector, nGG, nSectors)
 
         if root != '':
             root.progressBar['value'] = 0.4
 
+        # Connectie BasGoed-GG en NSTR
+        # (cumulatieve kansen)
+        GGtoNSTRcont, GGtoNSTRncont = get_gg_to_nstr(varDict, nGG, nNSTR)
+
         # Connectie BasGoed-GG en logistiek segment
         # (kansen, niet cumulatief)
-        GGtoLScontProb = np.array(pd.read_csv(
-            varDict['BGGG_TO_LS_CONT'],
-            sep=',',
-            header=None))
-        GGtoLSncontProb = np.array(pd.read_csv(
-            varDict['BGGG_TO_LS_NCONT'],
-            sep=',',
-            header=None))
+        GGtoLScontProb, GGtoLSncontProb = get_gg_to_ls(varDict, nGG, nLS)
 
-        for gg in range(nGG):
-            if np.sum(GGtoLScontProb[gg, :]) > 0:
-                GGtoLScontProb[gg, :] /= np.sum(GGtoLScontProb[gg, :])
-            else:
-                GGtoLScontProb[gg, :] = (np.ones(nLS) / nLS)
+        # Tonnen uit de Modal Split module van BasGoed
+        tonnes = get_tonnes_ms(varDict, GGtoLSncontProb, forecast, nGG, nLS)
 
-            if np.sum(GGtoLSncontProb[gg, :]) > 0:
-                GGtoLSncontProb[gg, :] /= np.sum(GGtoLSncontProb[gg, :])
-            else:
-                GGtoLSncontProb[gg, :] = (np.ones(nLS) / nLS)
+        # Tonnen uit de Container Keten module van BasGoed
+        tonnesCKM = get_tonnes_ckm(varDict, GGtoLScontProb, forecast, nGG, nLS)
 
-        # Road tonnes calculated by BasGoed
-        if forecast:
-            filename = 'Forecast'
-        else:
-            filename = 'BaseMergedModes'
-
-        tonnes = pd.read_csv(
-            varDict['BASGOED_MS'] + f'{filename}1.matrix',
-            sep='\t')[['orig', 'dest', 'road']]
-        tonnes.columns = ['ORIG', 'DEST', 'WeightDay']
-        tonnes['GG'] = 1
-
-        for gg in range(2, nGG + 1):
-            tonnesGG = pd.read_csv(
-                varDict['BASGOED_MS'] + f'{filename}{gg}.matrix',
-                sep='\t')[['orig', 'dest', 'road']]
-            tonnesGG.columns = ['ORIG', 'DEST', 'WeightDay']
-            tonnesGG['GG'] = gg
-            tonnes = tonnes.append(tonnesGG.copy())
-
-        tonnes['WeightDay'] /= varDict['YEARFACTOR']
-        tonnes = tonnes.sort_values(by=['ORIG', 'DEST', 'GG'])
-        tonnes.index = np.arange(len(tonnes))
-
-        # Spreid tonnen niet-container over logistieke segmenten
-        tonnesLS = np.zeros((nLS * len(tonnes), 5), dtype=float)
-        row = 0
-        for i in tonnes.index:
-            orig = tonnes.at[i, 'ORIG']
-            dest = tonnes.at[i, 'DEST']
-            gg = tonnes.at[i, 'GG']
-            weight = tonnes.at[i, 'WeightDay']
-
-            for ls in range(nLS):
-                fracLS = GGtoLSncontProb[gg - 1, ls]
-
-                if fracLS > 0:
-                    tonnesLS[row, 0] = orig
-                    tonnesLS[row, 1] = dest
-                    tonnesLS[row, 2] = gg
-                    tonnesLS[row, 3] = ls
-                    tonnesLS[row, 4] = weight * fracLS
-
-                row += 1
-
-        tonnesLS = tonnesLS[tonnesLS[:, 4] > 0]
-        tonnes = pd.DataFrame(
-            tonnesLS,
-            columns=['ORIG', 'DEST', 'GG', 'LS', 'WeightDay'])
-        intCols = ['ORIG', 'DEST', 'GG', 'LS']
-        tonnes[intCols] = tonnes[intCols].astype(int)
-
-        # Containerized road tonnes calculated by BasGoed
-        if forecast:
-            filename = 'Forecast'
-        else:
-            filename = 'Base'
-
-        tonnesCKM = pd.read_csv(
-            varDict['BASGOED_CKM'] + f'{filename}1.matrix',
-            sep='\t')[['orig', 'dest', 'road']]
-        tonnesCKM.columns = ['ORIG', 'DEST', 'WeightDay']
-        tonnesCKM['GG'] = 1
-
-        for gg in range(2, nGG + 1):
-            tonnesGG = pd.read_csv(
-                varDict['BASGOED_CKM'] + f'{filename}{gg}.matrix',
-                sep='\t')[['orig', 'dest', 'road']]
-            tonnesGG.columns = ['ORIG', 'DEST', 'WeightDay']
-            tonnesGG['GG'] = gg
-            tonnesCKM = tonnesCKM.append(tonnesGG.copy())
-
-        tonnesCKM['WeightDay'] /= varDict['YEARFACTOR']
-        tonnesCKM = tonnesCKM.sort_values(by=['ORIG', 'DEST', 'GG'])
-        tonnesCKM.index = np.arange(len(tonnesCKM))
-
-        # Spreid tonnen container over logistieke segmenten
-        tonnesLS = np.zeros((nLS * len(tonnesCKM), 5), dtype=float)
-        row = 0
-        for i in tonnesCKM.index:
-            orig = tonnesCKM.at[i, 'ORIG']
-            dest = tonnesCKM.at[i, 'DEST']
-            gg = tonnesCKM.at[i, 'GG']
-            weight = tonnesCKM.at[i, 'WeightDay']
-
-            for ls in range(nLS):
-                fracLS = GGtoLScontProb[gg - 1, ls]
-
-                if fracLS > 0:
-                    tonnesLS[row, 0] = orig
-                    tonnesLS[row, 1] = dest
-                    tonnesLS[row, 2] = gg
-                    tonnesLS[row, 3] = ls
-                    tonnesLS[row, 4] = weight * fracLS
-
-                row += 1
-
-        tonnesLS = tonnesLS[tonnesLS[:, 4] > 0]
-        tonnesCKM = pd.DataFrame(
-            tonnesLS,
-            columns=['ORIG', 'DEST', 'GG', 'LS', 'WeightDay'])
-        intCols = ['ORIG', 'DEST', 'GG', 'LS']
-        tonnesCKM[intCols] = tonnesCKM[intCols].astype(int)
-
-        del tonnesLS, tonnesGG
-
-        # Container statistics
+        # Container statistieken
         containerStats = pd.read_csv(
             varDict['CONTAINER'],
             sep=',',
@@ -507,28 +276,6 @@ def actually_run_module(args):
             else:
                 dictBGtoNRM[i] = np.array([BGtoNRM.at[i, 'SEGNR_2018']])
 
-        # Connectie BasGoed-GG en NSTR (cumulatieve kansen)
-        GGtoNSTRcont = np.array(pd.read_csv(
-            varDict['BGGG_TO_NSTR_CONT'],
-            sep=',',
-            header=None))
-        GGtoNSTRncont = np.array(pd.read_csv(
-            varDict['BGGG_TO_NSTR_NCONT'],
-            sep=',',
-            header=None))
-
-        for gg in range(nGG):
-            if np.sum(GGtoNSTRcont[gg, :]) == 0:
-                GGtoNSTRcont[gg, :] = np.ones(nNSTR)
-            if np.sum(GGtoNSTRncont[gg, :]) == 0:
-                GGtoNSTRncont[gg, :] = np.ones(nNSTR)
-
-            GGtoNSTRcont[gg, :] = np.cumsum(GGtoNSTRcont[gg, :])
-            GGtoNSTRncont[gg, :] = np.cumsum(GGtoNSTRncont[gg, :])
-
-            GGtoNSTRcont[gg, :] /= GGtoNSTRcont[gg, -1]
-            GGtoNSTRncont[gg, :] /= GGtoNSTRncont[gg, -1]
-
         if root != '':
             root.progressBar['value'] = 0.6
 
@@ -541,25 +288,6 @@ def actually_run_module(args):
 
         if root != '':
             root.progressBar['value'] = 1.5
-
-        # Calculate urban density of zones
-        urbanDensityCat = {}
-
-        for i in zones.index:
-            tmpNumInhabitants = zones.at[i, 'INWONERS' + yrAppendix]
-            tmpSurface = zones.at[i, 'OPP']
-            tmpUrbanDensity = 100 * (tmpNumInhabitants / tmpSurface)
-
-            if tmpUrbanDensity < 500:
-                urbanDensityCat[i] = 1
-            elif tmpUrbanDensity < 1000:
-                urbanDensityCat[i] = 2
-            elif tmpUrbanDensity < 1500:
-                urbanDensityCat[i] = 3
-            elif tmpUrbanDensity < 2500:
-                urbanDensityCat[i] = 4
-            else:
-                urbanDensityCat[i] = 5
 
         # Import logistic nodes data
         logNodes = pd.read_csv(varDict['DISTRIBUTIECENTRA'])
@@ -718,82 +446,15 @@ def actually_run_module(args):
         if root != '':
             root.progressBar['value'] = 1.7
 
-        # Skim with travel times and distances
-        skimTravTime = read_mtx(varDict['SKIMTIME'])
-        skimDistance = read_mtx(varDict['SKIMDISTANCE'])
+        # Haal skim met reistijden en afstanden op
+        skimTravTime, skimDistance = get_skims(varDict, changeZeroValues=True)
         nZones = int(len(skimTravTime)**0.5)
-
-        skimTravTime[skimTravTime < 0] = 0
-        skimDistance[skimDistance < 0] = 0
-
-        # For zero times and distances assume half the value to the
-        # nearest (non-zero) zone
-        # (otherwise we get problem in the distance decay function)
-        for orig in range(nZones):
-
-            whereZero = np.where(
-                skimTravTime[orig * nZones + np.arange(nZones)] == 0)[0]
-            whereNonZero = np.where(
-                skimTravTime[orig * nZones + np.arange(nZones)] != 0)[0]
-            if len(whereZero) > 0:
-                skimTravTime[orig * nZones + whereZero] = (
-                    0.5 * np.min(skimTravTime[orig * nZones + whereNonZero]))
-
-            whereZero = np.where(
-                skimDistance[orig * nZones + np.arange(nZones)] == 0)[0]
-            whereNonZero = np.where(
-                skimDistance[orig * nZones + np.arange(nZones)] != 0)[0]
-            if len(whereZero) > 0:
-                skimDistance[orig * nZones + whereZero] = (
-                    0.5 * np.min(skimDistance[orig * nZones + whereNonZero]))
 
         if root != '':
             root.progressBar['value'] = 2.5
 
         # Cost parameters by vehicle type with size (small/medium/large)
-        costFreight = [None for vt in range(nVT)]
-        costFreight[0] = np.array(pd.read_csv(
-            varDict['COST_VRACHTWAGEN'],
-            sep='\t'))[:, :3]
-        costFreight[3] = np.array(pd.read_csv(
-            varDict['COST_AANHANGER'],
-            sep='\t'))[:, :3]
-        costFreight[5] = np.array(pd.read_csv(
-            varDict['COST_OPLEGGER'],
-            sep='\t'))[:, :3]
-        costFreight[6] = np.array(pd.read_csv(
-            varDict['COST_SPECIAAL'],
-            sep='\t'))[:, :3]
-        costFreight[7] = np.array(pd.read_csv(
-            varDict['COST_LZV'],
-            sep='\t'))[:, :3]
-        costFreight[8] = np.array(pd.read_csv(
-            varDict['COST_BESTEL'],
-            sep='\t'))[:, :3]
-        costFreight[1] = costFreight[0]
-        costFreight[2] = costFreight[0]
-        costFreight[4] = costFreight[3]
-
-        # Fill in missing goods types
-        for vt in range(nVT):
-            newArray = np.zeros((nGG, 3), dtype=float)
-
-            for gg in range(nGG):
-                if (gg + 1) not in costFreight[vt][:, 0]:
-                    newArray[gg, :] = [gg + 1, 0, 0]
-                else:
-                    row = np.where(costFreight[vt][:, 0] == (gg + 1))[0]
-                    newArray[gg, :] = costFreight[vt][row, :]
-
-            costFreight[vt] = newArray
-
-        # Restructure cost array
-        costFreightKm = np.zeros((nGG, nVT), dtype=float)
-        costFreightHr = np.zeros((nGG, nVT), dtype=float)
-        for gg in range(nGG):
-            for vt in range(nVT):
-                costFreightKm[gg, vt] = costFreight[vt][gg, 1]
-                costFreightHr[gg, vt] = costFreight[vt][gg, 2]
+        costFreightHr, costFreightKm = get_cost_freight(varDict, nVT, nGG)
 
         # Estimated parameters MNL for combined shipment size and vehicle type
         paramsShipSizeVehType = pd.read_csv(
@@ -810,36 +471,13 @@ def actually_run_module(args):
                 sep=',',
                 index_col='Segment'))
 
-            # Vehicle/combustion shares (for UCC scenario)
-            sharesUCC = pd.read_csv(
-                varDict['ZEZ_SCENARIO'],
-                index_col='Segment')
-
-            vtNamesUCC = [
-                'LEVV', 'Moped',
-                'Van', 'Truck',
-                'TractorTrailer', 'WasteCollection',
-                'SpecialConstruction']
-
-            # Assume no consolidation potential and vehicle type switch
-            # for dangerous goods
-            sharesUCC = np.array(sharesUCC)[:-1, :-1]
-
-            # Only vehicle shares (summed up combustion types)
-            sharesVehUCC = np.zeros((nLS - 1, len(vtNamesUCC)))
-            for ls in range(nLS - 1):
-                sharesVehUCC[ls, 0] = np.sum(sharesUCC[ls, 0:5])
-                sharesVehUCC[ls, 1] = np.sum(sharesUCC[ls, 5:10])
-                sharesVehUCC[ls, 2] = np.sum(sharesUCC[ls, 10:15])
-                sharesVehUCC[ls, 3] = np.sum(sharesUCC[ls, 15:20])
-                sharesVehUCC[ls, 4] = np.sum(sharesUCC[ls, 20:25])
-                sharesVehUCC[ls, 5] = np.sum(sharesUCC[ls, 25:30])
-                sharesVehUCC[ls, 6] = np.sum(sharesUCC[ls, 30:35])
-                sharesVehUCC[ls, :] = (
-                    np.cumsum(sharesVehUCC[ls, :]) /
-                    np.sum(sharesVehUCC[ls, :]))
+            # Kansen per voertuigtype in het UCC-scenario
+            # (per logistiek segment een rij)
+            sharesVehUCC = get_shares_veh_ucc(varDict, nLS)
 
             # Couple these vehicle types to HARMONY vehicle types
+            # (keys: vehicle types in consecutive order in ZEZ_SCENARIO)
+            # (values: vehicle types in output files)
             vehUccToVeh = {
                 0: 9,
                 1: 10,
@@ -2003,58 +1641,12 @@ def actually_run_module(args):
                 "Shipment Synthesizer: " +
                 "Writing Shapefile")
 
-        Ax = list(ship_origX.values())
-        Ay = list(ship_origY.values())
-        Bx = list(ship_destX.values())
-        By = list(ship_destY.values())
-
-        # Initialize shapefile fields
-        filename = (
-            varDict['OUTPUTFOLDER'] +
-            f"Shipments_{varDict['LABEL']}.shp")
-        w = shp.Writer(filename)
-        w.field('SHIP_ID', 'N', size=6, decimal=0)
-        w.field('ORIG_BG', 'N', size=3, decimal=0)
-        w.field('DEST_BG', 'N', size=3, decimal=0)
-        w.field('ORIG_NRM', 'N', size=4, decimal=0)
-        w.field('DEST_NRM', 'N', size=4, decimal=0)
-        w.field('ORIG_LMS', 'N', size=4, decimal=0)
-        w.field('DEST_LMS', 'N', size=4, decimal=0)
-        w.field('ORIG_DC', 'N', size=5, decimal=0)
-        w.field('DEST_DC', 'N', size=5, decimal=0)
-        w.field('ORIG_TT', 'N', size=5, decimal=0)
-        w.field('DEST_TT', 'N', size=5, decimal=0)
-        w.field('BG_GG', 'N', size=2, decimal=0)
-        w.field('NSTR', 'N', size=2, decimal=0)
-        w.field('LOGSEG', 'N', size=2, decimal=0)
-        w.field('FLOWTYPE', 'N', size=2, decimal=0)
-        w.field('WEIGHT_CAT', 'N', size=2, decimal=0)
-        w.field('WEIGHT', 'N', size=4, decimal=2)
-        w.field('VEHTYPE', 'N', size=2, decimal=0)
-        w.field('CONTAINER', 'N', size=2, decimal=0)
-        if varDict['LABEL'] == 'UCC':
-            w.field('FROM_UCC', 'N', size=2, decimal=0)
-            w.field('TO_UCC', 'N', size=2, decimal=0)
-
-        dbfData = np.array(shipments, dtype=object)
-        for i in range(nShips):
-            # Add geometry
-            w.line([[[Ax[i], Ay[i]],
-                     [Bx[i], By[i]]]])
-
-            # Add data fields
-            w.record(*dbfData[i, :])
-
-            if i % 500 == 0:
-                print('\t' + str(round((i / nShips) * 100, 1)) + '%', end='\r')
-
-                if root != '':
-                    root.progressBar['value'] = (
-                        percStart + (percEnd - percStart) * i / nShips)
-
-        w.close()
-
-        print('\t100.0%', end='\r')
+        write_shape(
+            varDict,
+            shipments,
+            ship_origX, ship_origY,
+            ship_destX, ship_destY,
+            root, percStart, percEnd)
 
         totaltime = round(time.time() - start_time, 2)
         log_file.write("Total runtime: %s seconds\n" % (totaltime))
@@ -2105,3 +1697,600 @@ def actually_run_module(args):
 
         else:
             return [1, [sys.exc_info()[0], traceback.format_exc()]]
+
+
+def get_make_use(
+    varDict: dict,
+    convGG: dict,
+    convSector: dict,
+    nGG: int, nSectors: int
+):
+    """
+    Haal de maak-gebruik tabellen op en maar een kansverdeling van.
+
+    Args:
+        varDict (dict): _description_
+        convGG (dict): _description_
+        convSector (dict): _description_
+        nGG (int): _description_
+        nSectors (int): _description_
+
+    Returns:
+        tuple: Met daarin:
+            - numpy.ndarray: MakeDistribution.
+            - numpy.ndarray: UseDistribution.
+    """
+    # Import make-use table BasGoed
+    makeUseTable = np.array(pd.read_csv(
+        varDict['BASGOED_PARAMETERS'] + "MakeUseEerstJr.asc",
+        sep='\t'))
+
+    # Convert the goods types and sectors
+    for i in range(len(makeUseTable)):
+        makeUseTable[i, 0] = convGG.get(makeUseTable[i, 0], -1)
+        makeUseTable[i, 1] = convSector.get(makeUseTable[i, 1], -1)
+
+    # Remove rows with no known converstion for the goods type or sector
+    makeUseTable = makeUseTable[
+        (makeUseTable[:, 0] >= 0) & (makeUseTable[:, 1] >= 0), :]
+
+    # Create make and use distribution tables
+    # (by BG-GG and NRM-industry-sector)
+    makeDistribution = np.zeros((nGG, nSectors))
+    useDistribution = np.zeros((nGG, nSectors))
+    for i in range(len(makeUseTable)):
+        gg = int(makeUseTable[i, 0])
+        sector = int(makeUseTable[i, 1])
+        makeWeight = makeUseTable[i, 2]
+        useWeight = makeUseTable[i, 3]
+
+        makeDistribution[gg - 1, sector] += makeWeight
+        useDistribution[gg - 1,  sector] += useWeight
+
+    for gg in range(nGG):
+        sumMake = np.sum(makeDistribution[gg, :])
+        sumUse = np.sum(useDistribution[gg, :])
+
+        if sumMake > 0:
+            makeDistribution[gg, :] /= sumMake
+        else:
+            makeDistribution[gg, :] = (np.ones(nSectors) / nSectors)
+
+        if sumUse > 0:
+            useDistribution[gg, :] /= sumUse
+        else:
+            useDistribution[gg, :] = (np.ones(nSectors) / nSectors)
+
+    return makeDistribution, useDistribution
+
+
+def get_gg_to_ls(
+    varDict: dict,
+    nGG: int, nLS: int
+):
+    """
+    Bepaal de  kansverdeling (niet cumulatief) per combinatie van
+    BasGoed-goederengroep en logistiek segment voor container en voor
+    niet-container.
+
+    Args:
+        varDict (dict): _description_
+        nGG (int): _description_
+        nLS (int): _description_
+
+    Returns:
+        tuple: Met daarin:
+            - numpy.ndarray: Cumulatieve kansen GG naar LS (container)
+            - numpy.ndarray: Cumulatieve kansen GG naar LS (niet-container)
+    """
+    GGtoLScontProb = np.array(pd.read_csv(
+        varDict['BGGG_TO_LS_CONT'],
+        sep=',',
+        header=None))
+    GGtoLSncontProb = np.array(pd.read_csv(
+        varDict['BGGG_TO_LS_NCONT'],
+        sep=',',
+        header=None))
+
+    for gg in range(nGG):
+        if np.sum(GGtoLScontProb[gg, :]) > 0:
+            GGtoLScontProb[gg, :] /= np.sum(GGtoLScontProb[gg, :])
+        else:
+            GGtoLScontProb[gg, :] = (np.ones(nLS) / nLS)
+
+        if np.sum(GGtoLSncontProb[gg, :]) > 0:
+            GGtoLSncontProb[gg, :] /= np.sum(GGtoLSncontProb[gg, :])
+        else:
+            GGtoLSncontProb[gg, :] = (np.ones(nLS) / nLS)
+
+    return GGtoLScontProb, GGtoLSncontProb
+
+
+def get_gg_to_nstr(
+    varDict: dict,
+    nGG: int, nNSTR: int
+):
+    """
+    Bepaal de cumulatieve kansverdeling per combinatie van
+    BasGoed-goederengroep en NSTR-goederengroep voor container en voor
+    niet-container.
+
+    Args:
+        varDict (dict): _description_
+        nGG (int): _description_
+        nNSTR (int): _description_
+
+    Returns:
+        tuple: Met daarin:
+            - numpy.ndarray: Cumulatieve kansen GG naar NSTR (container)
+            - numpy.ndarray: Cumulatieve kansen GG naar NSTR (niet-container)
+    """
+    GGtoNSTRcont = np.array(pd.read_csv(
+        varDict['BGGG_TO_NSTR_CONT'],
+        sep=',',
+        header=None))
+    GGtoNSTRncont = np.array(pd.read_csv(
+        varDict['BGGG_TO_NSTR_NCONT'],
+        sep=',',
+        header=None))
+
+    for gg in range(nGG):
+        if np.sum(GGtoNSTRcont[gg, :]) == 0:
+            GGtoNSTRcont[gg, :] = np.ones(nNSTR)
+        if np.sum(GGtoNSTRncont[gg, :]) == 0:
+            GGtoNSTRncont[gg, :] = np.ones(nNSTR)
+
+        GGtoNSTRcont[gg, :] = np.cumsum(GGtoNSTRcont[gg, :])
+        GGtoNSTRncont[gg, :] = np.cumsum(GGtoNSTRncont[gg, :])
+
+        GGtoNSTRcont[gg, :] /= GGtoNSTRcont[gg, -1]
+        GGtoNSTRncont[gg, :] /= GGtoNSTRncont[gg, -1]
+
+    return GGtoNSTRcont, GGtoNSTRncont
+
+
+def get_tonnes_ms(
+    varDict: dict,
+    GGtoLSncontProb: np.ndarray,
+    forecast: bool,
+    nGG: int, nLS: int
+):
+    """
+    Haal de tonnen voor wegvervoer uit de Modal Split module van
+    BasGoed op.
+
+    Args:
+        varDict (dict): _description_
+        GGtoLSncontProb (numpy.ndarray): _description_
+        forecast (bool): _description_
+        nGG (int): _description_
+        nLS (int): _description_
+
+    Returns:
+        pandas.DataFrame: De tonnages per H-B-GG.
+    """
+    if forecast:
+        filename = 'Forecast'
+    else:
+        filename = 'BaseMergedModes'
+
+    tonnes = pd.read_csv(
+        varDict['BASGOED_MS'] + f'{filename}1.matrix',
+        sep='\t')[['orig', 'dest', 'road']]
+    tonnes.columns = ['ORIG', 'DEST', 'WeightDay']
+    tonnes['GG'] = 1
+
+    for gg in range(2, nGG + 1):
+        tonnesGG = pd.read_csv(
+            varDict['BASGOED_MS'] + f'{filename}{gg}.matrix',
+            sep='\t')[['orig', 'dest', 'road']]
+        tonnesGG.columns = ['ORIG', 'DEST', 'WeightDay']
+        tonnesGG['GG'] = gg
+        tonnes = tonnes.append(tonnesGG.copy())
+
+    tonnes['WeightDay'] /= varDict['YEARFACTOR']
+    tonnes = tonnes.sort_values(by=['ORIG', 'DEST', 'GG'])
+    tonnes.index = np.arange(len(tonnes))
+
+    # Spreid tonnen niet-container over logistieke segmenten
+    tonnesLS = np.zeros((nLS * len(tonnes), 5), dtype=float)
+    row = 0
+    for i in tonnes.index:
+        orig = tonnes.at[i, 'ORIG']
+        dest = tonnes.at[i, 'DEST']
+        gg = tonnes.at[i, 'GG']
+        weight = tonnes.at[i, 'WeightDay']
+
+        for ls in range(nLS):
+            fracLS = GGtoLSncontProb[gg - 1, ls]
+
+            if fracLS > 0:
+                tonnesLS[row, 0] = orig
+                tonnesLS[row, 1] = dest
+                tonnesLS[row, 2] = gg
+                tonnesLS[row, 3] = ls
+                tonnesLS[row, 4] = weight * fracLS
+
+            row += 1
+
+    tonnesLS = tonnesLS[tonnesLS[:, 4] > 0]
+    tonnes = pd.DataFrame(
+        tonnesLS,
+        columns=['ORIG', 'DEST', 'GG', 'LS', 'WeightDay'])
+    intCols = ['ORIG', 'DEST', 'GG', 'LS']
+    tonnes[intCols] = tonnes[intCols].astype(int)
+
+    return tonnes
+
+
+def get_tonnes_ckm(
+    varDict: dict,
+    GGtoLScontProb: np.ndarray,
+    forecast: bool,
+    nGG: int, nLS: int
+):
+    """
+    Haal de tonnen voor wegvervoer uit de Container Keten module van
+    BasGoed op.
+
+    Args:
+        varDict (dict): _description_
+        GGtoLScontProb (numpy.ndarray): _description_
+        forecast (bool): _description_
+        nGG (int): _description_
+        nLS (int): _description_
+
+    Returns:
+        pandas.DataFrame: De tonnages per H-B-GG.
+    """
+    if forecast:
+        filename = 'Forecast'
+    else:
+        filename = 'Base'
+
+    tonnesCKM = pd.read_csv(
+        varDict['BASGOED_CKM'] + f'{filename}1.matrix',
+        sep='\t')[['orig', 'dest', 'road']]
+    tonnesCKM.columns = ['ORIG', 'DEST', 'WeightDay']
+    tonnesCKM['GG'] = 1
+
+    for gg in range(2, nGG + 1):
+        tonnesGG = pd.read_csv(
+            varDict['BASGOED_CKM'] + f'{filename}{gg}.matrix',
+            sep='\t')[['orig', 'dest', 'road']]
+        tonnesGG.columns = ['ORIG', 'DEST', 'WeightDay']
+        tonnesGG['GG'] = gg
+        tonnesCKM = tonnesCKM.append(tonnesGG.copy())
+
+    tonnesCKM['WeightDay'] /= varDict['YEARFACTOR']
+    tonnesCKM = tonnesCKM.sort_values(by=['ORIG', 'DEST', 'GG'])
+    tonnesCKM.index = np.arange(len(tonnesCKM))
+
+    # Spreid tonnen container over logistieke segmenten
+    tonnesLS = np.zeros((nLS * len(tonnesCKM), 5), dtype=float)
+    row = 0
+    for i in tonnesCKM.index:
+        orig = tonnesCKM.at[i, 'ORIG']
+        dest = tonnesCKM.at[i, 'DEST']
+        gg = tonnesCKM.at[i, 'GG']
+        weight = tonnesCKM.at[i, 'WeightDay']
+
+        for ls in range(nLS):
+            fracLS = GGtoLScontProb[gg - 1, ls]
+
+            if fracLS > 0:
+                tonnesLS[row, 0] = orig
+                tonnesLS[row, 1] = dest
+                tonnesLS[row, 2] = gg
+                tonnesLS[row, 3] = ls
+                tonnesLS[row, 4] = weight * fracLS
+
+            row += 1
+
+    tonnesLS = tonnesLS[tonnesLS[:, 4] > 0]
+    tonnesCKM = pd.DataFrame(
+        tonnesLS,
+        columns=['ORIG', 'DEST', 'GG', 'LS', 'WeightDay'])
+    intCols = ['ORIG', 'DEST', 'GG', 'LS']
+    tonnesCKM[intCols] = tonnesCKM[intCols].astype(int)
+
+    return tonnesCKM
+
+
+def get_cost_freight(
+    varDict: dict,
+    nVT: int, nGG: int
+):
+    """
+    Lees de uur- en kilometerkosten voor vracht in.
+
+    Args:
+        varDict (dict): _description_
+        nVT (int): _description_
+        nGG (int): _description_
+
+    Returns:
+        tuple: Met daarin:
+            - numpy.ndarray: Uurkosten per goederengroep en voertuigtype
+            - numpy.ndarray: Kilometerkosten per goederengroep en voertuigtype
+    """
+    costFreight = [None for vt in range(nVT)]
+    costFreight[0] = np.array(pd.read_csv(
+        varDict['COST_VRACHTWAGEN'],
+        sep='\t'))[:, :3]
+    costFreight[3] = np.array(pd.read_csv(
+        varDict['COST_AANHANGER'],
+        sep='\t'))[:, :3]
+    costFreight[5] = np.array(pd.read_csv(
+        varDict['COST_OPLEGGER'],
+        sep='\t'))[:, :3]
+    costFreight[6] = np.array(pd.read_csv(
+        varDict['COST_SPECIAAL'],
+        sep='\t'))[:, :3]
+    costFreight[7] = np.array(pd.read_csv(
+        varDict['COST_LZV'],
+        sep='\t'))[:, :3]
+    costFreight[8] = np.array(pd.read_csv(
+        varDict['COST_BESTEL'],
+        sep='\t'))[:, :3]
+    costFreight[1] = costFreight[0]
+    costFreight[2] = costFreight[0]
+    costFreight[4] = costFreight[3]
+
+    # Fill in missing goods types
+    for vt in range(nVT):
+        newArray = np.zeros((nGG, 3), dtype=float)
+
+        for gg in range(nGG):
+            if (gg + 1) not in costFreight[vt][:, 0]:
+                newArray[gg, :] = [gg + 1, 0, 0]
+            else:
+                row = np.where(costFreight[vt][:, 0] == (gg + 1))[0]
+                newArray[gg, :] = costFreight[vt][row, :]
+
+        costFreight[vt] = newArray
+
+    # Restructure cost array
+    costFreightKm = np.zeros((nGG, nVT), dtype=float)
+    costFreightHr = np.zeros((nGG, nVT), dtype=float)
+    for gg in range(nGG):
+        for vt in range(nVT):
+            costFreightKm[gg, vt] = costFreight[vt][gg, 1]
+            costFreightHr[gg, vt] = costFreight[vt][gg, 2]
+
+    return costFreightHr, costFreightKm
+
+
+def get_shares_veh_ucc(
+    varDict: dict,
+    nLS: int
+):
+    """
+    Haal de kansen per voertuigtype voor het UCC-scenario op.
+
+    Args:
+        varDict (dict): _description_
+        nLS (int): _description_
+
+    Returns:
+        numpy.ndarray: De kansen per logistiek segment en voertuigtype.
+    """
+    # Vehicle/combustion shares (for UCC scenario)
+    sharesUCC = pd.read_csv(
+        varDict['ZEZ_SCENARIO'],
+        index_col='Segment')
+
+    vtNamesUCC = [
+        'LEVV', 'Moped',
+        'Van', 'Truck',
+        'TractorTrailer', 'WasteCollection',
+        'SpecialConstruction']
+
+    # Assume no consolidation potential and vehicle type switch
+    # for dangerous goods
+    sharesUCC = np.array(sharesUCC)[:-1, :-1]
+
+    # Only vehicle shares (summed up combustion types)
+    sharesVehUCC = np.zeros((nLS - 1, len(vtNamesUCC)))
+    for ls in range(nLS - 1):
+        sharesVehUCC[ls, 0] = np.sum(sharesUCC[ls, 0:5])
+        sharesVehUCC[ls, 1] = np.sum(sharesUCC[ls, 5:10])
+        sharesVehUCC[ls, 2] = np.sum(sharesUCC[ls, 10:15])
+        sharesVehUCC[ls, 3] = np.sum(sharesUCC[ls, 15:20])
+        sharesVehUCC[ls, 4] = np.sum(sharesUCC[ls, 20:25])
+        sharesVehUCC[ls, 5] = np.sum(sharesUCC[ls, 25:30])
+        sharesVehUCC[ls, 6] = np.sum(sharesUCC[ls, 30:35])
+        sharesVehUCC[ls, :] = (
+            np.cumsum(sharesVehUCC[ls, :]) /
+            np.sum(sharesVehUCC[ls, :]))
+
+    return sharesVehUCC
+
+
+@njit
+def choice_model_ssvt(
+    costFreightKm: np.ndarray, costFreightHr: np.ndarray,
+    goodsTypeBG: int,
+    fromDC: int, toDC: int,
+    travTime: float, distance: float,
+    absoluteShipmentSizes: np.ndarray,
+    truckCapacities: np.ndarray,
+    B_TransportCosts: float, B_InventoryCosts: float,
+    B_FromDC: float, B_ToDC: float,
+    B_LongHaul_TruckTrailer: float, B_LongHaul_TractorTrailer: float,
+    ASC_VT: float,
+    nVT: int, nSS: int,
+    container: bool = False
+):
+    """
+    Bereken de utilities en trek een keuze voor een
+    voertuigtype en zendingsgrootte.
+
+    Args:
+        costFreightKm (np.ndarray): _description_
+        costFreightHr (np.ndarray): _description_
+        goodsTypeBG (int): _description_
+        fromDC (int): _description_
+        toDC (int): _description_
+        travTime (float): _description_
+        distance (float): _description_
+        absoluteShipmentSizes (np.ndarray): _description_
+        truckCapacities (np.ndarray): _description_
+        B_TransportCosts (float): _description_
+        B_InventoryCosts (float): _description_
+        B_FromDC (float): _description_
+        B_ToDC (float): _description_
+        B_LongHaul_TruckTrailer (float): _description_
+        B_LongHaul_TractorTrailer (float): _description_
+        ASC_VT (float): _description_
+        nVT (int): _description_
+        nSS (int): _description_
+        container (bool, optional): _description_. Defaults to False.
+
+    Returns:
+        integer: De index van het getrokken alternatief.
+    """
+    # Determine the utility and probability for each alternative
+    utilities = np.zeros(nVT * nSS, dtype=float64)
+
+    inventoryCosts = absoluteShipmentSizes
+    longHaul = int(distance > 100)
+
+    for ss in range(nSS):
+        for vt in range(nVT):
+            index = ss * nVT + vt
+            costPerHr = costFreightHr[goodsTypeBG - 1, vt]
+            costPerKm = costFreightKm[goodsTypeBG - 1, vt]
+
+            # If vehicle type is available for the current goods type
+            if costPerHr > 0:
+                transportCosts = costPerHr * travTime + costPerKm * distance
+
+                # Multiply transport costs by number of required vehicles
+                transportCosts *= np.ceil(
+                    absoluteShipmentSizes[ss] / truckCapacities[vt])
+
+                # Utility function
+                if container and vt != 5:
+                    utilities[index] = -100
+                else:
+                    utilities[index] = (
+                        B_TransportCosts * transportCosts +
+                        B_InventoryCosts * inventoryCosts[ss] +
+                        B_FromDC * fromDC * (vt == 0) +
+                        B_ToDC * toDC * (vt in [3, 4, 5]) +
+                        B_LongHaul_TruckTrailer * longHaul * (vt in [3, 4]) +
+                        B_LongHaul_TractorTrailer * longHaul * (vt == 5) +
+                        ASC_VT[vt])
+            else:
+                utilities[index] = -100
+
+    probs = np.exp(utilities) / np.sum(np.exp(utilities))
+    cumProbs = np.cumsum(probs)
+
+    # Sample one choice based on the cumulative probability distribution
+    ssvt = draw_choice(cumProbs)
+
+    return ssvt
+
+
+@njit
+def draw_choice(cumProbs: np.ndarray):
+    '''
+    Trek een keuze uit een array met cumulatieve kansen.
+
+    Args:
+        cumProbs (numpy.ndarray): _description_
+
+    Returns:
+        integer: De index van het getrokken alternatief.
+    '''
+    nAlt = len(cumProbs)
+
+    rand = np.random.rand()
+    for alt in range(nAlt):
+        if cumProbs[alt] >= rand:
+            return alt
+
+    raise Exception(
+        '\nError in function "draw_choice", random draw was ' +
+        'outside range of cumulative probability distribution.')
+
+
+def write_shape(
+    varDict: dict,
+    shipments: pd.DataFrame,
+    ship_origX: dict,
+    ship_origY: dict,
+    ship_destX: dict,
+    ship_destY: dict,
+    root='', percStart=95, percEnd=100
+):
+    """
+    Schrijf de zendingen naar een shapefile-bestand.
+
+    Args:
+        varDict (dict): _description_
+        shipments (pd.DataFrame): _description_
+        ship_origX (dict): _description_
+        ship_origY (dict): _description_
+        ship_destX (dict): _description_
+        ship_destY (dict): _description_
+        root (str, optional): _description_. Defaults to ''.
+        percStart (int, optional): _description_. Defaults to 95.
+        percEnd (int, optional): _description_. Defaults to 100.
+    """
+    Ax = list(ship_origX.values())
+    Ay = list(ship_origY.values())
+    Bx = list(ship_destX.values())
+    By = list(ship_destY.values())
+
+    # Initialize shapefile fields
+    filename = (
+        varDict['OUTPUTFOLDER'] +
+        f"Shipments_{varDict['LABEL']}.shp")
+    w = shp.Writer(filename)
+    w.field('SHIP_ID', 'N', size=6, decimal=0)
+    w.field('ORIG_BG', 'N', size=3, decimal=0)
+    w.field('DEST_BG', 'N', size=3, decimal=0)
+    w.field('ORIG_NRM', 'N', size=4, decimal=0)
+    w.field('DEST_NRM', 'N', size=4, decimal=0)
+    w.field('ORIG_LMS', 'N', size=4, decimal=0)
+    w.field('DEST_LMS', 'N', size=4, decimal=0)
+    w.field('ORIG_DC', 'N', size=5, decimal=0)
+    w.field('DEST_DC', 'N', size=5, decimal=0)
+    w.field('ORIG_TT', 'N', size=5, decimal=0)
+    w.field('DEST_TT', 'N', size=5, decimal=0)
+    w.field('BG_GG', 'N', size=2, decimal=0)
+    w.field('NSTR', 'N', size=2, decimal=0)
+    w.field('LOGSEG', 'N', size=2, decimal=0)
+    w.field('FLOWTYPE', 'N', size=2, decimal=0)
+    w.field('WEIGHT_CAT', 'N', size=2, decimal=0)
+    w.field('WEIGHT', 'N', size=4, decimal=2)
+    w.field('VEHTYPE', 'N', size=2, decimal=0)
+    w.field('CONTAINER', 'N', size=2, decimal=0)
+    if varDict['LABEL'] == 'UCC':
+        w.field('FROM_UCC', 'N', size=2, decimal=0)
+        w.field('TO_UCC', 'N', size=2, decimal=0)
+
+    dbfData = np.array(shipments, dtype=object)
+    nShips = dbfData.shape[0]
+    for i in range(nShips):
+        # Add geometry
+        w.line([[
+            [Ax[i], Ay[i]],
+            [Bx[i], By[i]]]])
+
+        # Add data fields
+        w.record(*dbfData[i, :])
+
+        if i % 500 == 0:
+            print('\t' + str(round((i / nShips) * 100, 1)) + '%', end='\r')
+
+            if root != '':
+                root.progressBar['value'] = (
+                    percStart + (percEnd - percStart) * i / nShips)
+
+    w.close()
+
+    print('\t100.0%', end='\r')
