@@ -1,40 +1,34 @@
-# -*- coding: utf-8 -*-
-"""
-Created on Thu Oct 22 12:17:13 2020
-
-@author: modelpc
-"""
 import pandas as pd
 import numpy as np
 import shapefile as shp
 import array
 import os.path
+import multiprocessing as mp
 
 
-
-def read_mtx(mtxfile):  
+def read_mtx(mtxfile):
     '''
     Read a binary mtx-file (skimTijd and skimAfstand)
     '''
     mtxData = array.array('f')  # i for integer
-    mtxData.fromfile(open(mtxfile, 'rb'), os.path.getsize(mtxfile) // mtxData.itemsize)
-    
+    mtxData.fromfile(
+        open(mtxfile, 'rb'),
+        os.path.getsize(mtxfile) // mtxData.itemsize)
+
     # The number of zones is in the first byte
     mtxData = np.array(mtxData, dtype=float)[1:]
-    
+
     return mtxData
 
 
-
-def write_mtx(filename, mat, aantalZones):
+def write_mtx(filename, mat, nZones):
     '''
     Write an array into a binary file
     '''
-    mat     = np.append(aantalZones,mat)
-    matBin  = array.array('f')
+    mat = np.append(nZones, mat)
+    matBin = array.array('f')
     matBin.fromlist(list(mat))
     matBin.tofile(open(filename, 'wb'))
-
 
 
 def read_shape(shapePath, encoding='latin1', returnGeometry=False):
@@ -50,26 +44,29 @@ def read_shape(shapePath, encoding='latin1', returnGeometry=False):
         geometry = [geometry[i]['geometry'] for i in range(len(geometry))]
     fields = sf.fields
     sf.close()
-    
+
     # Get information on the fields in the DBF
-    columns  = [x[0] for x in fields[1:]]
+    columns = [x[0] for x in fields[1:]]
     colTypes = [x[1:] for x in fields[1:]]
     nRecords = len(records)
-    
+
     # Check for headers that appear twice
     for col in range(len(columns)):
         name = columns[col]
-        whereName = [i for i in range(len(columns)) if columns[i]==name]
+        whereName = [i for i in range(len(columns)) if columns[i] == name]
         if len(whereName) > 1:
-            for i in range(1,len(whereName)):
-                columns[whereName[i]] = str(columns[whereName[i]]) + '_' + str(i)
-                
-    # Put all the data records into a NumPy array (much faster than Pandas DataFrame)
-    shape = np.zeros((nRecords,len(columns)), dtype=object)
+            for i in range(1, len(whereName)):
+                columns[whereName[i]] = (
+                    str(columns[whereName[i]]) + '_' + str(i))
+
+    # Put all the data records into a NumPy array
+    #  (much faster than Pandas DataFrame)
+    shape = np.zeros((nRecords, len(columns)), dtype=object)
     for i in range(nRecords):
         shape[i,:] = records[i][0:]
-    
-    # Then put this into a Pandas DataFrame with the right headers and data types
+
+    # Then put this into a Pandas DataFrame with the right headers
+    # and data types
     shape = pd.DataFrame(shape, columns=columns)
     for col in range(len(columns)):
         if colTypes[col][0] == 'C':
@@ -80,12 +77,11 @@ def read_shape(shapePath, encoding='latin1', returnGeometry=False):
                 shape[columns[col]] = shape[columns[col]].astype(float)
             else:
                 shape[columns[col]] = shape[columns[col]].astype(int)
-            
+
     if returnGeometry:
         return (shape, geometry)
     else:
         return shape
-
 
 
 def read_nodes(pathNodes):
@@ -207,4 +203,84 @@ def read_links(pathLinks):
         links = links.fillna(-99999)
         links = links.astype(int)
            
-        return (links, loaded)    
+        return (links, loaded)
+
+
+def get_skims(
+    varDict: dict,
+    changeZeroValues: bool = False
+):
+    """
+    Lees de skim met reistijden en de skim met afstanden in.
+
+    Args:
+        varDict (dict): _description_
+        nZones (int): _description_
+
+    Returns:
+        tuple: Met daarin:
+            - numpy.ndarray: Skim met reistijden (in seconden)
+            - numpy.ndarray: Skim met afstanden (in meters)
+    """
+    skimTravTime = read_mtx(varDict['SKIMTIME'])
+    skimDistance = read_mtx(varDict['SKIMDISTANCE'])
+    nZones = int(len(skimTravTime)**0.5)
+
+    skimTravTime[skimTravTime < 0] = 0
+    skimDistance[skimDistance < 0] = 0
+
+    # For zero times and distances assume half the value to the
+    # nearest (non-zero) zone
+    # (otherwise we get problem in the distance decay function)
+    if changeZeroValues:
+        for orig in range(nZones):
+
+            whereZero = np.where(
+                skimTravTime[orig * nZones + np.arange(nZones)] == 0)[0]
+            whereNonZero = np.where(
+                skimTravTime[orig * nZones + np.arange(nZones)] != 0)[0]
+            if len(whereZero) > 0:
+                skimTravTime[orig * nZones + whereZero] = (
+                    0.5 * np.min(skimTravTime[orig * nZones + whereNonZero]))
+
+            whereZero = np.where(
+                skimDistance[orig * nZones + np.arange(nZones)] == 0)[0]
+            whereNonZero = np.where(
+                skimDistance[orig * nZones + np.arange(nZones)] != 0)[0]
+            if len(whereZero) > 0:
+                skimDistance[orig * nZones + whereZero] = (
+                    0.5 * np.min(skimDistance[orig * nZones + whereNonZero]))
+
+    return skimTravTime, skimDistance
+
+
+def determine_num_cpu(
+    varDict: dict,
+    maxCPU: int = 16
+):
+    if varDict['N_CPU'] not in ['', '""', "''"]:
+        try:
+            nCPU = int(varDict['N_CPU'])
+
+            if nCPU > mp.cpu_count():
+                nCPU = max(1, min(mp.cpu_count() - 1, maxCPU))
+                print(
+                    'N_CPU parameter too high. Only ' +
+                    str(mp.cpu_count()) +
+                    ' CPUs available. Hence defaulting to ' +
+                    str(nCPU) +
+                    'CPUs.')
+
+            if nCPU < 1:
+                nCPU = max(1, min(mp.cpu_count() - 1, maxCPU))
+
+        except ValueError:
+            nCPU = max(1, min(mp.cpu_count() - 1, maxCPU))
+            print(
+                'Could not convert N_CPU parameter to an integer. ' +
+                'Hence defaulting to ' + str(nCPU) + 'CPUs.')
+
+    else:
+        nCPU = max(1, min(mp.cpu_count() - 1, maxCPU))
+
+    return nCPU
