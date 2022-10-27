@@ -1,6 +1,0 @@
-ID	Comment
-0	CO2
-1	SO2
-2	PM
-3	NOX
-
